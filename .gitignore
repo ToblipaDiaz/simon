@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+
+data/
+*.sqlite3
+*.db
+data/exports/
+data/sessions/*.wav
+data/sessions/*.json
+data/sessions/*.txt
+data/sessions/*.docx

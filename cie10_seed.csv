@@ -1,0 +1,21 @@
+code,description,chapter
+G40,Epilepsia,VI Enfermedades del sistema nervioso
+G40.0,Epilepsia y síndromes epilépticos idiopáticos relacionados con localización,VI Enfermedades del sistema nervioso
+G40.1,Epilepsia y síndromes epilépticos sintomáticos relacionados con localización,VI Enfermedades del sistema nervioso
+G40.2,Epilepsia y síndromes epilépticos sintomáticos relacionados con localización con crisis parciales complejas,VI Enfermedades del sistema nervioso
+G40.3,Epilepsia y síndromes epilépticos idiopáticos generalizados,VI Enfermedades del sistema nervioso
+G40.9,Epilepsia no especificada,VI Enfermedades del sistema nervioso
+R56.8,Otras convulsiones y las no especificadas,XVIII Síntomas signos y hallazgos anormales
+G43,Migraña,VI Enfermedades del sistema nervioso
+R51,Cefalea,XVIII Síntomas signos y hallazgos anormales
+G80,Parálisis cerebral,VI Enfermedades del sistema nervioso
+G80.9,Parálisis cerebral no especificada,VI Enfermedades del sistema nervioso
+F80,Trastornos específicos del desarrollo del habla y del lenguaje,V Trastornos mentales y del comportamiento
+F80.9,Trastorno del desarrollo del habla y del lenguaje no especificado,V Trastornos mentales y del comportamiento
+F81,Trastornos específicos del desarrollo de las habilidades escolares,V Trastornos mentales y del comportamiento
+F84.0,Autismo infantil,V Trastornos mentales y del comportamiento
+F84.9,Trastorno generalizado del desarrollo no especificado,V Trastornos mentales y del comportamiento
+F90.0,Perturbación de la actividad y de la atención,V Trastornos mentales y del comportamiento
+R62.0,Retardo del desarrollo fisiológico normal,XVIII Síntomas signos y hallazgos anormales
+Z00.1,Control de salud de rutina del niño,XXI Factores que influyen en el estado de salud
+Z03.3,Observación por sospecha de trastorno del sistema nervioso,XXI Factores que influyen en el estado de salud
