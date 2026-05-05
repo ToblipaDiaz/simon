@@ -1,5 +1,9 @@
 .env
+.env.*
+!.env.example
+
 .venv/
+venv/
 __pycache__/
 *.pyc
 
@@ -7,10 +11,13 @@ data/
 *.sqlite3
 *.db
 
-data/sessions/
-data/exports/
 *.wav
 *.mp3
-*.docx
+*.m4a
+*.ogg
 
-.secrets.baseline
+*.docx
+*.pdf
+*.json
+
+.streamlit/secrets.toml
