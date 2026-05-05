@@ -75,7 +75,18 @@ def get_int_setting(name: str, default: int) -> int:
 # =========================================================
 
 OPENAI_API_KEY = get_setting("OPENAI_API_KEY", "")
-client = OpenAI(api_key=OPENAI_API_KEY or "missing-openai-api-key")
+
+
+def get_openai_client() -> OpenAI:
+    """Crea el cliente OpenAI solo si existe una API key válida en Secrets/entorno."""
+    api_key = get_setting("OPENAI_API_KEY", "")
+    if not api_key:
+        st.error(
+            "Falta configurar OPENAI_API_KEY en los Secrets de Streamlit Cloud. "
+            "No pongas la API key dentro del código ni en GitHub."
+        )
+        st.stop()
+    return OpenAI(api_key=api_key)
 os.makedirs(ASSETS_DIR, exist_ok=True)
 
 ADMIN_ROLE = "admin"
@@ -1248,7 +1259,7 @@ EXTENSION AMBULATORIA:
 - Los diagnósticos sugeridos no reemplazan el juicio médico. Si no corresponde, devuelve suggested_icd10 como array vacío.
 - Mantén baja alucinación: no inventes códigos exactos si no estás razonablemente seguro; usa descripciones conservadoras.
 """
-    resp = client.responses.create(
+    resp = get_openai_client().responses.create(
         model=LLM_MODEL,
         temperature=0.1,
         input=[
@@ -1451,7 +1462,7 @@ def summarize_images_with_llm(images_data_urls: List[str], instruction: str) -> 
     content = [{"type": "text", "text": instruction}]
     for url in images_data_urls:
         content.append({"type": "input_image", "image_url": url})
-    resp = client.responses.create(model=VISION_MODEL, input=[{"role": "user", "content": content}], temperature=0.2)
+    resp = get_openai_client().responses.create(model=VISION_MODEL, input=[{"role": "user", "content": content}], temperature=0.2)
     return (resp.output_text or "").strip()
 
 # =========================================================
@@ -3499,7 +3510,7 @@ with st.expander("9) Chat y búsqueda sobre la consulta", expanded=False):
         )
         with st.chat_message("assistant"):
             with st.spinner("Pensando..."):
-                resp = client.responses.create(
+                resp = get_openai_client().responses.create(
                     model=CHAT_MODEL,
                     temperature=0.2,
                     input=[
