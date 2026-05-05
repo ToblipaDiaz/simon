@@ -6,8 +6,11 @@ __pycache__/
 data/
 *.sqlite3
 *.db
+
+data/sessions/
 data/exports/
-data/sessions/*.wav
-data/sessions/*.json
-data/sessions/*.txt
-data/sessions/*.docx
+*.wav
+*.mp3
+*.docx
+
+.secrets.baseline
