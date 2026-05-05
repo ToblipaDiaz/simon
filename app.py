@@ -20,11 +20,16 @@ import requests
 
 import pandas as pd
 import streamlit as st
-import sounddevice as sd
 import soundfile as sf
-from dotenv import load_dotenv
 from openai import OpenAI
 from docx import Document
+
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_AVAILABLE = True
+except Exception:
+    sd = None
+    SOUNDDEVICE_AVAILABLE = False
 
 from whisper_local import transcribe_whisper
 from prompts import SYSTEM_INSTRUCTIONS
@@ -34,19 +39,49 @@ ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 APP_ICON_PATH = os.path.join(ASSETS_DIR, "asistente_simon_icon.png")
 APP_NAME = "Simon Assistant"
 
+
+def get_setting(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value not in (None, ""):
+        return str(value)
+    try:
+        value = st.secrets.get(name, None)
+    except Exception:
+        value = None
+    if value in (None, ""):
+        return default
+    return str(value)
+
+
+def get_bool_setting(name: str, default: bool = False) -> bool:
+    raw = get_setting(name, "")
+    if raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "si", "sí", "on"}
+
+
+def get_int_setting(name: str, default: int) -> int:
+    raw = get_setting(name, "")
+    if raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
 # =========================================================
 # Proyecto Jorge Ambulatorio - Windows
 # Ficha clinica ambulatorio + IA + CIE-10 + HL7 v2 preparado
 # =========================================================
 
-load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
-client = OpenAI()
+OPENAI_API_KEY = get_setting("OPENAI_API_KEY", "")
+client = OpenAI(api_key=OPENAI_API_KEY or "missing-openai-api-key")
 os.makedirs(ASSETS_DIR, exist_ok=True)
 
 ADMIN_ROLE = "admin"
 DOCTOR_ROLE = "doctor"
-DEFAULT_ADMIN_EMAIL = os.getenv("PJ_ADMIN_EMAIL", "kinepdiaz@gmail.com").strip().lower()
-DEFAULT_ADMIN_PASSWORD = os.getenv("PJ_ADMIN_PASSWORD", "admin1234")
+DEFAULT_ADMIN_EMAIL = get_setting("PJ_ADMIN_EMAIL", "kinepdiaz@gmail.com").strip().lower()
+DEFAULT_ADMIN_PASSWORD = get_setting("PJ_ADMIN_PASSWORD", "admin1234")
 LEGACY_DEFAULT_ADMIN_EMAIL = "admin@gmail.com"
 
 
@@ -507,20 +542,20 @@ for d in [DATA_DIR, SESSIONS_DIR, EXPORTS_DIR]:
 
 SCHEMA_VERSION = "v5-ambulatory-ehr-flat-schema-hl7"
 PROMPT_VERSION = "v3-jorge-ambulatory-icd10"
-LLM_MODEL = os.getenv("OPENAI_NOTE_MODEL", "gpt-4o")
-VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini")
-CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
-AUTO_EMAIL_ON_NOTE = os.getenv("AUTO_EMAIL_ON_NOTE", "true").lower() == "true"
+LLM_MODEL = get_setting("OPENAI_NOTE_MODEL", "gpt-4o")
+VISION_MODEL = get_setting("OPENAI_VISION_MODEL", "gpt-4o-mini")
+CHAT_MODEL = get_setting("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+SMTP_HOST = get_setting("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = get_int_setting("SMTP_PORT", 587)
+SMTP_USER = get_setting("SMTP_USER", "")
+SMTP_PASSWORD = get_setting("SMTP_PASSWORD", "")
+SMTP_FROM = get_setting("SMTP_FROM", SMTP_USER)
+AUTO_EMAIL_ON_NOTE = get_bool_setting("AUTO_EMAIL_ON_NOTE", True)
 
 AUDIO_SR = 16000
 MAX_CONTEXT_ORGANIZED = 18000
 MAX_CONTEXT_IMAGES = 6000
-DEFAULT_AUDIO_DEVICE = os.getenv("WINDOWS_AUDIO_DEVICE", "")
+DEFAULT_AUDIO_DEVICE = get_setting("WINDOWS_AUDIO_DEVICE", "")
 
 # =========================================================
 # Utilidades generales
@@ -938,15 +973,18 @@ def search_cie10(term: str, limit: int = 30) -> pd.DataFrame:
 # =========================================================
 # Audio y cache
 # =========================================================
+AUDIO_UPLOAD_TYPES = ["wav", "mp3", "m4a", "ogg"]
+
+
 def patient_audio_prefix(patient_id: Optional[int]) -> str:
     return f"{int(patient_id)}_paciente" if patient_id else ""
 
 
-def patient_audio_path(patient_id: Optional[int], kind: str) -> str:
+def next_patient_audio_path(patient_id: Optional[int], kind: str, extension: str = "wav") -> str:
     if not patient_id:
         raise ValueError("Primero selecciona o guarda un paciente para asociar el audio.")
     prefix = patient_audio_prefix(patient_id)
-    existing = glob.glob(os.path.join(SESSIONS_DIR, f"{prefix}_audio*.wav"))
+    existing = glob.glob(os.path.join(SESSIONS_DIR, f"{prefix}_audio*.*"))
     max_seq = 0
     pattern = re.compile(rf"^{re.escape(prefix)}_audio(\d+)", re.IGNORECASE)
     for path in existing:
@@ -954,7 +992,29 @@ def patient_audio_path(patient_id: Optional[int], kind: str) -> str:
         if match:
             max_seq = max(max_seq, int(match.group(1)))
     safe_kind = re.sub(r"[^A-Za-z0-9_-]+", "", kind or "audio").lower()
-    return os.path.join(SESSIONS_DIR, f"{prefix}_audio{max_seq + 1:02d}_{safe_kind}.wav")
+    safe_ext = re.sub(r"[^A-Za-z0-9]+", "", extension or "wav").lower()
+    if safe_ext not in AUDIO_UPLOAD_TYPES:
+        safe_ext = "wav"
+    return os.path.join(SESSIONS_DIR, f"{prefix}_audio{max_seq + 1:02d}_{safe_kind}.{safe_ext}")
+
+
+def patient_audio_path(patient_id: Optional[int], kind: str) -> str:
+    return next_patient_audio_path(patient_id, kind, "wav")
+
+
+def save_uploaded_audio(uploaded_file, patient_id: Optional[int], kind: str) -> str:
+    original_name = uploaded_file.name or ""
+    extension = os.path.splitext(original_name)[1].lstrip(".").lower() or "wav"
+    data = uploaded_file.getvalue()
+    upload_key = sha1_text(f"{patient_id}|{kind}|{original_name}|{len(data)}|{hashlib.sha1(data).hexdigest()}")
+    cached = st.session_state.get("uploaded_audio_cache") or {}
+    if cached.get("key") == upload_key and cached.get("path") and os.path.exists(cached["path"]):
+        return cached["path"]
+    path = next_patient_audio_path(patient_id, f"{kind}_subido", extension)
+    with open(path, "wb") as f:
+        f.write(data)
+    st.session_state["uploaded_audio_cache"] = {"key": upload_key, "path": path}
+    return path
 
 
 def audio_belongs_to_patient(path: str, patient_id: Optional[int]) -> bool:
@@ -964,8 +1024,10 @@ def audio_belongs_to_patient(path: str, patient_id: Optional[int]) -> bool:
 
 
 def get_latest_audio(prefix: Optional[str] = None, patient_id: Optional[int] = None) -> Optional[str]:
-    pattern = "*.wav" if not prefix else f"{prefix}_*.wav"
-    files = glob.glob(os.path.join(SESSIONS_DIR, pattern))
+    patterns = [f"*.{ext}" if not prefix else f"{prefix}_*.{ext}" for ext in AUDIO_UPLOAD_TYPES]
+    files = []
+    for pattern in patterns:
+        files.extend(glob.glob(os.path.join(SESSIONS_DIR, pattern)))
     if patient_id:
         files = [p for p in files if audio_belongs_to_patient(p, patient_id)]
     if not files:
@@ -991,7 +1053,9 @@ def audio_file_label(path: Optional[str]) -> str:
 
 
 def list_audio_files(patient_id: Optional[int] = None) -> Tuple[List[str], List[str], List[str]]:
-    all_wavs = glob.glob(os.path.join(SESSIONS_DIR, "*.wav"))
+    all_wavs = []
+    for ext in AUDIO_UPLOAD_TYPES:
+        all_wavs.extend(glob.glob(os.path.join(SESSIONS_DIR, f"*.{ext}")))
     if patient_id:
         all_wavs = [p for p in all_wavs if audio_belongs_to_patient(p, patient_id)]
     all_wavs.sort(key=os.path.getmtime, reverse=True)
@@ -1006,6 +1070,8 @@ def note_cache_path(note_key: str) -> str:
 
 
 def list_audio_devices() -> str:
+    if not SOUNDDEVICE_AVAILABLE:
+        return "La grabacion local no esta disponible porque sounddevice/PortAudio no se pudo cargar en este entorno."
     try:
         devices = sd.query_devices()
         lines = [f"Sistema: {platform.system()} {platform.release()}", "", "Dispositivos de audio detectados:"]
@@ -1016,7 +1082,7 @@ def list_audio_devices() -> str:
             marker = " <-- entrada" if max_in > 0 else ""
             lines.append(f"[{idx}] {dev.get('name')} | in={max_in} out={max_out} sr={default_sr}{marker}")
         lines.append("")
-        lines.append("Si necesitas forzar un micrófono, crea/edita .env con WINDOWS_AUDIO_DEVICE=numero_del_dispositivo, por ejemplo WINDOWS_AUDIO_DEVICE=1")
+        lines.append("Si necesitas forzar un microfono, configura WINDOWS_AUDIO_DEVICE con el numero del dispositivo, por ejemplo WINDOWS_AUDIO_DEVICE=1")
         return "\n".join(lines)
     except Exception as e:
         return f"No se pudieron listar dispositivos de audio: {e}"
@@ -1033,6 +1099,11 @@ def _audio_device_value():
 
 
 def record_wav(path: str, seconds: int, samplerate: int = AUDIO_SR, audio_device=None):
+    if not SOUNDDEVICE_AVAILABLE:
+        raise RuntimeError(
+            "La grabacion local no esta disponible en este entorno porque sounddevice/PortAudio no se pudo cargar. "
+            "En Streamlit Cloud usa la opcion para subir un audio."
+        )
     device = audio_device if audio_device is not None else _audio_device_value()
     try:
         audio = sd.rec(
@@ -1051,7 +1122,7 @@ def record_wav(path: str, seconds: int, samplerate: int = AUDIO_SR, audio_device
             f"Detalle: {e}\n\n"
             "Revisa que el micrófono esté permitido para aplicaciones de escritorio en Windows, "
             "que no esté ocupado por otra aplicación y, si es necesario, usa 'Listar dispositivos de audio' "
-            "para configurar WINDOWS_AUDIO_DEVICE en el archivo .env."
+            "para configurar la variable WINDOWS_AUDIO_DEVICE."
         )
 
 
@@ -1883,14 +1954,13 @@ def render_soap_from_note(note_text:str, note_json:Optional[dict], meta:dict) ->
     return header + f"\nS - Subjetivo:\n{clean(subj)}\n\nO - Objetivo:\n{clean(obj)}\n\nA - Evaluación / Análisis:\n{clean(ana)}\n\nP - Plan:\n{clean(plan)}\n"
 
 def get_smtp_config() -> dict:
-    load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
-    smtp_user = (os.getenv("SMTP_USER") or "kinepdiaz@gmail.com").strip()
+    smtp_user = (get_setting("SMTP_USER", "kinepdiaz@gmail.com") or "").strip()
     return {
-        "host": (os.getenv("SMTP_HOST") or "smtp.gmail.com").strip(),
-        "port": int(os.getenv("SMTP_PORT") or "587"),
+        "host": get_setting("SMTP_HOST", "smtp.gmail.com").strip(),
+        "port": get_int_setting("SMTP_PORT", 587),
         "user": smtp_user,
-        "password": (os.getenv("SMTP_PASSWORD") or "").replace(" ", "").strip(),
-        "from": "kinepdiaz@gmail.com",
+        "password": get_setting("SMTP_PASSWORD", "").replace(" ", "").strip(),
+        "from": get_setting("SMTP_FROM", smtp_user or "kinepdiaz@gmail.com").strip(),
     }
 
 def mask_secret(value:str) -> str:
@@ -1905,7 +1975,7 @@ def send_email_with_attachment(to_email:str, subject:str, body:str, attachment_p
     if not to_email:
         return False, 'El profesional autenticado no tiene correo configurado.'
     if not cfg["user"] or not cfg["password"]:
-        return False, 'Correo no configurado. Completa SMTP_USER y SMTP_PASSWORD en .env. Para Gmail usa App Password.'
+        return False, 'Correo no configurado. Completa SMTP_USER y SMTP_PASSWORD como variables de entorno o en st.secrets. Para Gmail usa App Password.'
     msg=EmailMessage(); msg['From']=cfg["from"]; msg['To']=to_email; msg['Subject']=subject; msg.set_content(body)
     with open(attachment_path,'rb') as f: data=f.read()
     msg.add_attachment(data, maintype='application', subtype='vnd.openxmlformats-officedocument.wordprocessingml.document', filename=os.path.basename(attachment_path))
@@ -1917,10 +1987,7 @@ def send_email_with_attachment(to_email:str, subject:str, body:str, attachment_p
         return False, f'No se pudo enviar el correo: {e}'
 
 def env_flag(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "si", "sí", "on"}
+    return get_bool_setting(name, default)
 
 
 def valid_env_secret(value: Optional[str]) -> bool:
@@ -1940,9 +2007,9 @@ def google_login_enabled() -> bool:
 
 def google_oauth_configured() -> bool:
     return google_login_enabled() and all([
-        valid_env_secret(os.getenv('GOOGLE_CLIENT_ID')),
-        valid_env_secret(os.getenv('GOOGLE_CLIENT_SECRET')),
-        valid_env_secret(os.getenv('GOOGLE_REDIRECT_URI')),
+        valid_env_secret(get_setting('GOOGLE_CLIENT_ID')),
+        valid_env_secret(get_setting('GOOGLE_CLIENT_SECRET')),
+        valid_env_secret(get_setting('GOOGLE_REDIRECT_URI')),
     ])
 
 
@@ -1950,8 +2017,8 @@ def google_oauth_authorization_url() -> Optional[str]:
     if not google_oauth_configured():
         return None
     params = {
-        'client_id': os.getenv('GOOGLE_CLIENT_ID'),
-        'redirect_uri': os.getenv('GOOGLE_REDIRECT_URI'),
+        'client_id': get_setting('GOOGLE_CLIENT_ID'),
+        'redirect_uri': get_setting('GOOGLE_REDIRECT_URI'),
         'response_type': 'code',
         'scope': 'openid email profile',
         'access_type': 'offline',
@@ -1965,9 +2032,9 @@ def exchange_google_code(code: str) -> Optional[dict]:
     token_url = 'https://oauth2.googleapis.com/token'
     data = {
         'code': code,
-        'client_id': os.getenv('GOOGLE_CLIENT_ID'),
-        'client_secret': os.getenv('GOOGLE_CLIENT_SECRET'),
-        'redirect_uri': os.getenv('GOOGLE_REDIRECT_URI'),
+        'client_id': get_setting('GOOGLE_CLIENT_ID'),
+        'client_secret': get_setting('GOOGLE_CLIENT_SECRET'),
+        'redirect_uri': get_setting('GOOGLE_REDIRECT_URI'),
         'grant_type': 'authorization_code',
     }
     try:
@@ -2058,7 +2125,7 @@ def require_login():
                 st.caption('Inicia sesión con tu cuenta de Google si ya la tienes configurada en la consola de Google Cloud.')
             elif google_login_enabled():
                 st.divider()
-                st.warning('Para habilitar ingreso con Google, configura GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET y GOOGLE_REDIRECT_URI en tu .env.')
+                st.warning('Para habilitar ingreso con Google, configura GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET y GOOGLE_REDIRECT_URI como variables de entorno o en st.secrets.')
     st.stop()
 
 def require_profile_completion(user:dict):
@@ -2595,7 +2662,7 @@ def render_admin_page(user:dict):
                         st.error(f'No se pudo actualizar el centro: {e}')
     with tab3:
         cfg = get_smtp_config()
-        auto_email = os.getenv("AUTO_EMAIL_ON_NOTE", "true").lower() == "true"
+        auto_email = get_bool_setting("AUTO_EMAIL_ON_NOTE", True)
         st.code(
             f"SMTP_HOST={cfg['host']}\n"
             f"SMTP_PORT={cfg['port']}\n"
@@ -2678,7 +2745,7 @@ with st.sidebar:
     elif google_oauth_configured():
         st.success('Google login habilitado')
     else:
-        st.info('Para habilitar Google login, agrega GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET y GOOGLE_REDIRECT_URI en tu .env')
+        st.info('Para habilitar Google login, agrega GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET y GOOGLE_REDIRECT_URI como variables de entorno o en st.secrets')
 
     st.markdown('---')
     if st.button('Cerrar sesión', key='logout'):
@@ -3040,6 +3107,8 @@ with col1:
         if st.button("Grabar conversación"):
             if not st.session_state.get("patient_id"):
                 st.error("Primero guarda o selecciona un paciente para asociar el audio.")
+            elif not SOUNDDEVICE_AVAILABLE:
+                st.warning("La grabacion local no esta disponible porque sounddevice/PortAudio no se pudo cargar. En Streamlit Cloud sube un audio en la seccion 3.3.")
             else:
                 wav_path = patient_audio_path(st.session_state.get("patient_id"), "conversacion")
                 with st.spinner("Grabando conversación..."):
@@ -3053,6 +3122,8 @@ with col2:
         if st.button("Grabar dictado"):
             if not st.session_state.get("patient_id"):
                 st.error("Primero guarda o selecciona un paciente para asociar el audio.")
+            elif not SOUNDDEVICE_AVAILABLE:
+                st.warning("La grabacion local no esta disponible porque sounddevice/PortAudio no se pudo cargar. En Streamlit Cloud sube un audio en la seccion 3.3.")
             else:
                 wav_path = patient_audio_path(st.session_state.get("patient_id"), "dictado")
                 with st.spinner("Grabando dictado..."):
@@ -3071,6 +3142,28 @@ with st.expander("3.3 Procesar audio y generar nota clínica IA", expanded=True)
         use_latest = st.checkbox("Usar último audio disponible si no hay seleccionado", value=True)
         active_audio_patient_id = st.session_state.get("patient_id")
         conv_files, dict_files, other_files = list_audio_files(active_audio_patient_id)
+
+        st.markdown("**Subir audio de la consulta**")
+        upload_kind = st.radio(
+            "Tipo de audio subido",
+            ["conversacion", "dictado"],
+            format_func=lambda x: "Conversacion" if x == "conversacion" else "Dictado medico",
+            horizontal=True,
+        )
+        audio_file = st.file_uploader("Sube un audio de la consulta", type=AUDIO_UPLOAD_TYPES)
+        if audio_file is not None:
+            audio_bytes = audio_file.getvalue()
+            audio_ext = os.path.splitext(audio_file.name or "")[1].lstrip(".").lower() or "wav"
+            st.audio(audio_bytes, format=audio_file.type or f"audio/{audio_ext}")
+            if not active_audio_patient_id:
+                st.warning("Primero guarda o selecciona un paciente para asociar el audio subido.")
+            else:
+                uploaded_path = save_uploaded_audio(audio_file, active_audio_patient_id, upload_kind)
+                if upload_kind == "dictado":
+                    st.session_state["wav_dict"] = uploaded_path
+                else:
+                    st.session_state["wav_conv"] = uploaded_path
+                st.success(f"Audio subido guardado: {audio_file_label(uploaded_path)}")
 
         st.markdown("**Audio disponible**")
         if active_audio_patient_id:
