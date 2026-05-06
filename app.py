@@ -612,6 +612,33 @@ def export_docx(title: str, content: str, filename: str) -> str:
     return path
 
 
+def export_fhir_bundle_json(
+    patient: dict,
+    encounter: dict,
+    diagnoses_df: Optional[pd.DataFrame],
+    reviewed_note_text: str,
+    note_json: Optional[dict],
+    auth_user: Optional[dict],
+) -> str:
+    from app.core.clinical_note import clinical_note_from_project_rows
+    from app.fhir.bundles import build_document_bundle, export_bundle_json
+
+    diagnoses = diagnoses_df.to_dict("records") if diagnoses_df is not None and not diagnoses_df.empty else []
+    clinical_note = clinical_note_from_project_rows(
+        patient,
+        encounter,
+        diagnoses=diagnoses,
+        note_json=note_json,
+        reviewed_note_text=reviewed_note_text,
+        clinician_specialty=(auth_user or {}).get("specialty"),
+        clinician_license_number=(auth_user or {}).get("professional_id"),
+        physician_validated=(encounter.get("status") == "closed"),
+    )
+    bundle = build_document_bundle(clinical_note)
+    filename = f"fhir_bundle_{clinical_note.note_id}.json"
+    return export_bundle_json(bundle, os.path.join(EXPORTS_DIR, filename))
+
+
 def clean_str(value) -> str:
     if value is None:
         return ""
@@ -3389,7 +3416,7 @@ with st.expander("5) Nota clínica", expanded=True):
             st.write("Contradicciones:")
             st.write(note_json.get("contradictions", []))
 
-        e1, e2 = st.columns(2)
+        e1, e2, e3 = st.columns(3)
         with e1:
             if st.button("Exportar nota .txt"):
                 out = export_txt(edited_note, f"nota_encuentro_{st.session_state['encounter_id']}_{int(time.time())}.txt")
@@ -3398,6 +3425,13 @@ with st.expander("5) Nota clínica", expanded=True):
             if st.button("Exportar nota .docx"):
                 out = export_docx("Ficha clínica ambulatoria", edited_note, f"nota_encuentro_{st.session_state['encounter_id']}_{int(time.time())}.docx")
                 st.success(f"Guardado: {out}")
+        with e3:
+            if st.button("Exportar FHIR JSON"):
+                patient = get_patient(st.session_state["patient_id"])
+                diag_df = get_diagnoses_df(st.session_state["encounter_id"])
+                out = export_fhir_bundle_json(patient, encounter, diag_df, edited_note, note_json, auth_user)
+                st.success(f"FHIR Bundle guardado: {out}")
+                st.caption("Exportacion local solamente. El envio a HIS/RCE requiere FHIR_ENABLED=true, validacion medica y API formal.")
     else:
         st.caption("Aún no hay consulta activa.")
 

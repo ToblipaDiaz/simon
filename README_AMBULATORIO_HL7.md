@@ -60,3 +60,19 @@ Las exportaciones se guardan en:
 ```text
 data/exports
 ```
+
+## Preparacion FHIR R4
+
+La aplicacion incluye una capa `app/fhir` y adaptadores `app/integrations`
+para dejar el sistema FHIR-ready sin activar integracion real por defecto.
+
+- Exporta Bundle FHIR R4 JSON local desde la nota clinica.
+- Soporta Bundle `document` y `transaction`.
+- Mantiene flujo draft-first: la IA genera borradores y el medico debe revisar y validar.
+- El cliente REST FHIR generico queda desactivado si `FHIR_ENABLED=false`.
+- No se guardan tokens en archivos y los logs no deben imprimir transcripciones completas.
+
+Toda escritura real en HIS/RCE requiere validacion medica explicita,
+contrato/API formal del proveedor, perfiles de interoperabilidad acordados,
+credenciales aprobadas y ambiente de pruebas. No se debe usar ingenieria
+inversa ni escritura automatica sin revision clinica.
