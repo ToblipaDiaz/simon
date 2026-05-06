@@ -33,6 +33,21 @@ except Exception:
 
 from whisper_local import transcribe_whisper
 from prompts import SYSTEM_INSTRUCTIONS
+from app.hl7.audit import audit_event
+from app.hl7.config import HL7Settings
+from app.hl7.escape import compute_payload_sha256, prevent_phi_in_logs
+from app.hl7.messages import build_adt_a04 as build_adt_a04_message
+from app.hl7.messages import build_mdm_t02 as build_mdm_t02_message
+from app.hl7.storage import enqueue_message, ensure_hl7_tables, get_latest_message, get_message, update_message_status
+from app.hl7.transport import FileHL7Transport, get_hl7_transport
+from app.hl7.validators import HL7ValidationError, get_control_id, parse_ack, validate_message_ready
+from app.security import is_insecure_default_password, validate_admin_password_policy
+
+try:
+    from passlib.context import CryptContext
+    PASSWORD_CONTEXT = CryptContext(schemes=["argon2"], deprecated="auto")
+except Exception:
+    PASSWORD_CONTEXT = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
@@ -92,7 +107,8 @@ os.makedirs(ASSETS_DIR, exist_ok=True)
 ADMIN_ROLE = "admin"
 DOCTOR_ROLE = "doctor"
 DEFAULT_ADMIN_EMAIL = get_setting("PJ_ADMIN_EMAIL", "kinepdiaz@gmail.com").strip().lower()
-DEFAULT_ADMIN_PASSWORD = get_setting("PJ_ADMIN_PASSWORD", "admin1234")
+APP_ENV = get_setting("APP_ENV", "development").strip().lower() or "development"
+DEFAULT_ADMIN_PASSWORD = get_setting("PJ_ADMIN_PASSWORD", "")
 LEGACY_DEFAULT_ADMIN_EMAIL = "admin@gmail.com"
 
 
@@ -561,7 +577,9 @@ SMTP_PORT = get_int_setting("SMTP_PORT", 587)
 SMTP_USER = get_setting("SMTP_USER", "")
 SMTP_PASSWORD = get_setting("SMTP_PASSWORD", "")
 SMTP_FROM = get_setting("SMTP_FROM", SMTP_USER)
-AUTO_EMAIL_ON_NOTE = get_bool_setting("AUTO_EMAIL_ON_NOTE", True)
+SMTP_ENABLED = get_bool_setting("SMTP_ENABLED", False)
+AUTO_EMAIL_ON_NOTE = get_bool_setting("AUTO_EMAIL_ON_NOTE", False)
+HL7_SETTINGS = HL7Settings.from_env()
 
 AUDIO_SR = 16000
 MAX_CONTEXT_ORGANIZED = 18000
@@ -753,6 +771,7 @@ def init_db():
             );
             """
         )
+        ensure_hl7_tables(conn)
         patient_cols = [r["name"] for r in conn.execute("PRAGMA table_info(patients)").fetchall()]
         if "facility_id" not in patient_cols:
             conn.execute("ALTER TABLE patients ADD COLUMN facility_id INTEGER")
@@ -1493,101 +1512,35 @@ def summarize_images_with_llm(images_data_urls: List[str], instruction: str) -> 
     return (resp.output_text or "").strip()
 
 # =========================================================
-# HL7 v2 generator preparado para integración
+# HL7 v2 wrappers de compatibilidad
 # =========================================================
-def hl7_escape(value: str) -> str:
-    s = clean_str(value)
-    return (
-        s.replace("\\", "\\E\\")
-        .replace("|", "\\F\\")
-        .replace("^", "\\S\\")
-        .replace("&", "\\T\\")
-        .replace("~", "\\R\\")
-        .replace("\r", " ")
-        .replace("\n", "\\.br\\")
-    )
+def is_physician_reviewed(encounter: Optional[dict]) -> bool:
+    return bool((encounter or {}).get("physician_reviewed")) or (encounter or {}).get("status") in {"reviewed", "closed", "completed"}
 
 
-def patient_hl7_name(patient: dict) -> str:
-    last = hl7_escape(patient.get("last_name"))
-    first = hl7_escape(patient.get("first_name"))
-    return f"{last}^{first}"
+def build_adt_a04(patient: dict, encounter: dict, sending_app="ASISTENTE_SIMON", receiving_app="HIS_DESTINO") -> str:
+    settings = HL7Settings.from_env()
+    if sending_app:
+        settings = HL7Settings(**{**settings.__dict__, "sending_app": sending_app})
+    if receiving_app:
+        settings = HL7Settings(**{**settings.__dict__, "receiving_app": receiving_app})
+    return build_adt_a04_message(patient, encounter, settings=settings)
 
 
-def patient_birthdate_hl7(patient: dict) -> str:
-    bd = clean_str(patient.get("birth_date"))
-    if not bd:
-        return ""
-    try:
-        return datetime.strptime(bd, "%Y-%m-%d").strftime("%Y%m%d")
-    except ValueError:
-        return bd.replace("-", "")
-
-
-def build_adt_a04(patient: dict, encounter: dict, sending_app="PROYECTO_JORGE", receiving_app="HIS_DESTINO") -> str:
-    msg_id = f"PJ{encounter['id']}{int(time.time())}"
-    msh = f"MSH|^~\\&|{sending_app}|CONSULTA|{receiving_app}|HIS|{hl7_ts()}||ADT^A04^ADT_A01|{msg_id}|P|2.5"
-    evn = f"EVN|A04|{hl7_ts()}"
-    pid = "|".join([
-        "PID", "1", "", hl7_escape(patient.get("mrn")), "", patient_hl7_name(patient), "",
-        patient_birthdate_hl7(patient), hl7_escape(patient.get("sex")), "", "", hl7_escape(patient.get("address")), "",
-        hl7_escape(patient.get("phone")), "", "", "", "", hl7_escape(patient.get("national_id"))
-    ])
-    pv1 = "|".join([
-        "PV1", "1", "O", "AMBULATORIO", "", "", "", hl7_escape(encounter.get("provider_name")), "", "",
-        "NEUROPED", "", "", "", "", "", "", "", hl7_escape(str(encounter.get("id"))), "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", hl7_ts()
-    ])
-    return "\r".join([msh, evn, pid, pv1]) + "\r"
-
-
-def split_obx_text(text: str, chunk_size: int = 180) -> List[str]:
-    text = clean_str(text)
-    if not text:
-        return []
-    chunks = []
-    cur = ""
-    for word in text.split():
-        if len(cur) + len(word) + 1 > chunk_size:
-            chunks.append(cur)
-            cur = word
-        else:
-            cur = (cur + " " + word).strip()
-    if cur:
-        chunks.append(cur)
-    return chunks
-
-
-def build_mdm_t02(patient: dict, encounter: dict, diagnoses_df: pd.DataFrame, sending_app="PROYECTO_JORGE", receiving_app="HIS_DESTINO") -> str:
-    msg_id = f"PJMDM{encounter['id']}{int(time.time())}"
-    note = clean_str(encounter.get("note_text"))
-    msh = f"MSH|^~\\&|{sending_app}|CONSULTA|{receiving_app}|HIS|{hl7_ts()}||MDM^T02^MDM_T02|{msg_id}|P|2.5"
-    evn = f"EVN|T02|{hl7_ts()}"
-    pid = "|".join([
-        "PID", "1", "", hl7_escape(patient.get("mrn")), "", patient_hl7_name(patient), "",
-        patient_birthdate_hl7(patient), hl7_escape(patient.get("sex")), "", "", hl7_escape(patient.get("address")), "",
-        hl7_escape(patient.get("phone")), "", "", "", "", hl7_escape(patient.get("national_id"))
-    ])
-    pv1 = "|".join(["PV1", "1", "O", "AMBULATORIO", "", "", "", hl7_escape(encounter.get("provider_name")), "", "", "NEUROPED"])
-    txa = "|".join([
-        "TXA", "1", "CN", "AP", hl7_ts(), "", hl7_ts(), "", hl7_escape(encounter.get("provider_name")),
-        "", "", hl7_escape(f"PJ-DOC-{encounter['id']}"), "", "", "", "", "AU", "", "AV"
-    ])
-    segments = [msh, evn, pid, pv1, txa]
-    if diagnoses_df is not None and not diagnoses_df.empty:
-        for i, r in diagnoses_df.iterrows():
-            segments.append("|".join(["DG1", str(i + 1), "I10", f"{hl7_escape(r['code'])}^{hl7_escape(r['description'])}^CIE10", "", hl7_ts(), hl7_escape(r.get("diagnosis_type", ""))]))
-    obx_n = 1
-    for chunk in split_obx_text(note):
-        segments.append("|".join(["OBX", str(obx_n), "TX", "CLINNOTE^Nota Clinica^L", "1", hl7_escape(chunk), "", "", "", "", "F"]))
-        obx_n += 1
-    return "\r".join(segments) + "\r"
+def build_mdm_t02(patient: dict, encounter: dict, diagnoses_df: pd.DataFrame, sending_app="ASISTENTE_SIMON", receiving_app="HIS_DESTINO") -> str:
+    settings = HL7Settings.from_env()
+    if sending_app:
+        settings = HL7Settings(**{**settings.__dict__, "sending_app": sending_app})
+    if receiving_app:
+        settings = HL7Settings(**{**settings.__dict__, "receiving_app": receiving_app})
+    payload_encounter = {**encounter, "physician_reviewed": is_physician_reviewed(encounter)}
+    return build_mdm_t02_message(patient, payload_encounter, diagnoses_df, settings=settings, note_text=encounter.get("note_text") or "")
 
 
 def save_hl7_message(encounter_id: int, message_type: str, message: str) -> str:
-    filename = f"hl7_{message_type}_{encounter_id}_{int(time.time())}.hl7"
-    path = os.path.join(EXPORTS_DIR, filename)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write(message)
+    transport = FileHL7Transport(os.path.join(EXPORTS_DIR, "hl7"))
+    control_id = get_control_id(message) or f"AS{encounter_id}{int(time.time())}"
+    path = transport.send(message, control_id, message_type)
     with db() as conn:
         conn.execute(
             "INSERT INTO hl7_exports(encounter_id, message_type, file_path, created_at) VALUES (?, ?, ?, ?)",
@@ -1597,20 +1550,148 @@ def save_hl7_message(encounter_id: int, message_type: str, message: str) -> str:
     return path
 
 
+def latest_hl7_queue_message(encounter_id: int) -> Optional[dict]:
+    with db() as conn:
+        return get_latest_message(conn, encounter_id)
+
+
+def create_hl7_draft(
+    patient: dict,
+    encounter: dict,
+    diagnoses_df: Optional[pd.DataFrame],
+    message_type: str,
+    user_id: Optional[int],
+) -> int:
+    settings = HL7Settings.from_env()
+    encounter_payload = {**encounter, "physician_reviewed": is_physician_reviewed(encounter)}
+    if message_type == "ADT_A04":
+        payload = build_adt_a04_message(patient, encounter_payload, settings=settings)
+    else:
+        payload = build_mdm_t02_message(patient, encounter_payload, diagnoses_df, settings=settings, note_text=encounter.get("note_text") or "")
+        message_type = "MDM_T02"
+    control_id = get_control_id(payload)
+    with db() as conn:
+        message_id = enqueue_message(conn, int(encounter["id"]), message_type, control_id, payload, created_by_user_id=user_id, status="DRAFT")
+        audit_event(
+            conn,
+            action="hl7_generated",
+            entity_type="hl7_message",
+            entity_id=str(message_id),
+            user_id=user_id,
+            patient_id=patient.get("id"),
+            encounter_id=encounter.get("id"),
+            metadata={"message_type": message_type, "control_id": control_id, "payload_sha256": compute_payload_sha256(payload)},
+        )
+        conn.commit()
+    return message_id
+
+
+def validate_hl7_queue_message(message_id: int, encounter: dict) -> Tuple[bool, str]:
+    settings = HL7Settings.from_env()
+    with db() as conn:
+        message = get_message(conn, message_id)
+        if not message:
+            return False, "Mensaje HL7 no encontrado."
+        try:
+            validate_message_ready(
+                message["payload"],
+                message["message_type"],
+                settings=settings,
+                note_text=encounter.get("note_text") or "",
+                physician_reviewed=is_physician_reviewed(encounter),
+            )
+            update_message_status(conn, message_id, "READY")
+            audit_event(conn, "hl7_validated", "hl7_message", str(message_id), encounter_id=encounter.get("id"), metadata={"control_id": message["control_id"]})
+            conn.commit()
+            return True, "Mensaje HL7 validado y marcado READY."
+        except Exception as exc:
+            update_message_status(conn, message_id, "ERROR", error_message=str(exc))
+            audit_event(conn, "hl7_validation_failed", "hl7_message", str(message_id), encounter_id=encounter.get("id"), metadata={"error": str(exc)})
+            conn.commit()
+            return False, str(exc)
+
+
+def export_hl7_queue_message(message_id: int, user_id: Optional[int]) -> Tuple[bool, str]:
+    with db() as conn:
+        message = get_message(conn, message_id)
+        if not message:
+            return False, "Mensaje HL7 no encontrado."
+        path = save_hl7_message(int(message["encounter_id"]), message["message_type"], message["payload"])
+        audit_event(conn, "hl7_downloaded", "hl7_message", str(message_id), user_id=user_id, encounter_id=message.get("encounter_id"), metadata={"control_id": message["control_id"], "path": path})
+        conn.commit()
+    return True, path
+
+
+def send_hl7_queue_message(message_id: int, user_id: Optional[int]) -> Tuple[bool, str]:
+    settings = HL7Settings.from_env()
+    with db() as conn:
+        message = get_message(conn, message_id)
+        if not message:
+            return False, "Mensaje HL7 no encontrado."
+        if message["status"] != "READY":
+            return False, "El mensaje debe estar READY antes de enviar."
+        try:
+            receipt = get_hl7_transport(settings, BASE_DIR).send(message["payload"], message["control_id"], message["message_type"])
+            update_message_status(conn, message_id, "SENT")
+            audit_event(conn, "hl7_sent", "hl7_message", str(message_id), user_id=user_id, encounter_id=message.get("encounter_id"), metadata={"control_id": message["control_id"], "receipt": receipt})
+            if settings.mode == "mllp" and receipt:
+                ack = parse_ack(receipt)
+                update_message_status(conn, message_id, "ACKED" if ack.is_ack else "NACKED", ack_payload=receipt, error_message=None if ack.is_ack else ack.text)
+                audit_event(conn, "hl7_ack_received" if ack.is_ack else "hl7_nack_received", "hl7_message", str(message_id), user_id=user_id, encounter_id=message.get("encounter_id"), metadata={"msa": ack.status, "control_id": ack.control_id})
+            conn.commit()
+            return True, receipt
+        except Exception as exc:
+            update_message_status(conn, message_id, "ERROR", error_message=str(exc))
+            audit_event(conn, "hl7_send_failed", "hl7_message", str(message_id), user_id=user_id, encounter_id=message.get("encounter_id"), metadata={"error": str(exc)})
+            conn.commit()
+            return False, str(exc)
+
+
 # =========================================================
 # Usuarios, agenda, perfiles y correo
 # =========================================================
+def _is_default_admin_password(password: str) -> bool:
+    return is_insecure_default_password(password)
+
+
+def validate_startup_security():
+    try:
+        validate_admin_password_policy(APP_ENV, DEFAULT_ADMIN_PASSWORD)
+    except RuntimeError:
+        st.error("APP_ENV=production requiere configurar PJ_ADMIN_PASSWORD con una contraseña segura. No se permite admin1234 ni contraseña vacía.")
+        st.stop()
+    if SMTP_ENABLED and (not SMTP_USER or not SMTP_PASSWORD):
+        st.warning("SMTP_ENABLED=true, pero SMTP_USER/SMTP_PASSWORD no están configurados. No se enviarán correos clínicos.")
+    if AUTO_EMAIL_ON_NOTE:
+        st.warning("AUTO_EMAIL_ON_NOTE=true. No envíes datos clínicos por correo sin autorización institucional.")
+
+
 def _hash_password(password: str, salt: Optional[str] = None) -> str:
+    if salt is None and PASSWORD_CONTEXT is not None:
+        return PASSWORD_CONTEXT.hash(password)
     salt = salt or hashlib.sha256(os.urandom(16)).hexdigest()
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120000).hex()
     return f"{salt}${digest}"
 
 def _check_password(password: str, stored: str) -> bool:
+    if stored.startswith("$argon2") and PASSWORD_CONTEXT is not None:
+        try:
+            return bool(PASSWORD_CONTEXT.verify(password, stored))
+        except Exception:
+            return False
     try:
         salt, digest = stored.split("$", 1)
         return _hash_password(password, salt).split("$", 1)[1] == digest
     except Exception:
         return False
+
+
+def _password_needs_rehash(stored: str) -> bool:
+    if not stored:
+        return True
+    if stored.startswith("$argon2"):
+        return PASSWORD_CONTEXT.needs_update(stored) if PASSWORD_CONTEXT is not None else False
+    return PASSWORD_CONTEXT is not None
 
 def ensure_default_admin_and_facility():
     ts = now_iso()
@@ -1626,6 +1707,8 @@ def ensure_default_admin_and_facility():
                     (ADMIN_ROLE, ts, admin_user["id"]),
                 )
         else:
+            if _is_default_admin_password(DEFAULT_ADMIN_PASSWORD):
+                raise RuntimeError("Configura PJ_ADMIN_PASSWORD con una contraseña inicial segura antes de crear el administrador.")
             conn.execute(
                 "INSERT INTO users(email,password_hash,role,full_name,phone,specialty,preferred_note_format,first_login_completed,active,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (DEFAULT_ADMIN_EMAIL, _hash_password(DEFAULT_ADMIN_PASSWORD), ADMIN_ROLE, 'Administrador Simon Assistant', '', '', 'SOAP', 1, 1, ts, ts),
@@ -1671,7 +1754,14 @@ def get_user(user_id: int) -> Optional[dict]:
 
 def authenticate(email: str, password: str) -> Optional[dict]:
     user = get_user_by_email(email)
-    return user if user and _check_password(password, user.get('password_hash','')) else None
+    if not user or not _check_password(password, user.get('password_hash','')):
+        return None
+    if _password_needs_rehash(user.get("password_hash", "")):
+        with db() as conn:
+            conn.execute("UPDATE users SET password_hash=?, updated_at=? WHERE id=?", (_hash_password(password), now_iso(), user["id"]))
+            conn.commit()
+        user = get_user(user["id"]) or user
+    return user
 
 def create_user(email: str, password: str, role: str, full_name: str, phone: str='', specialty: str=''):
     ts=now_iso()
@@ -1970,6 +2060,9 @@ def confirm_reviewed_note_send_dialog():
                 out,
             )
             if ok:
+                with db() as conn:
+                    audit_event(conn, "email_sent", "encounter", str(encounter_id), user_id=(st.session_state.get("auth_user") or {}).get("id"), encounter_id=encounter_id, metadata={"to": to_email, "attachment": out})
+                    conn.commit()
                 st.session_state["pending_note_send"] = None
                 close_clinical_attention(encounter_id, f"Nota revisada enviada a {to_email}. Atención marcada como atendida y cerrada.")
                 st.rerun()
@@ -1992,13 +2085,14 @@ def render_soap_from_note(note_text:str, note_json:Optional[dict], meta:dict) ->
     return header + f"\nS - Subjetivo:\n{clean(subj)}\n\nO - Objetivo:\n{clean(obj)}\n\nA - Evaluación / Análisis:\n{clean(ana)}\n\nP - Plan:\n{clean(plan)}\n"
 
 def get_smtp_config() -> dict:
-    smtp_user = (get_setting("SMTP_USER", "kinepdiaz@gmail.com") or "").strip()
+    smtp_user = (get_setting("SMTP_USER", "") or "").strip()
     return {
+        "enabled": get_bool_setting("SMTP_ENABLED", False),
         "host": get_setting("SMTP_HOST", "smtp.gmail.com").strip(),
         "port": get_int_setting("SMTP_PORT", 587),
         "user": smtp_user,
         "password": get_setting("SMTP_PASSWORD", "").replace(" ", "").strip(),
-        "from": get_setting("SMTP_FROM", smtp_user or "kinepdiaz@gmail.com").strip(),
+        "from": get_setting("SMTP_FROM", smtp_user).strip(),
     }
 
 def mask_secret(value:str) -> str:
@@ -2012,6 +2106,8 @@ def send_email_with_attachment(to_email:str, subject:str, body:str, attachment_p
     to_email = (to_email or "").strip()
     if not to_email:
         return False, 'El profesional autenticado no tiene correo configurado.'
+    if not cfg["enabled"]:
+        return False, 'SMTP deshabilitado. Configura SMTP_ENABLED=true solo con autorización institucional para enviar datos clínicos.'
     if not cfg["user"] or not cfg["password"]:
         return False, 'Correo no configurado. Completa SMTP_USER y SMTP_PASSWORD como variables de entorno o en st.secrets. Para Gmail usa App Password.'
     msg=EmailMessage(); msg['From']=cfg["from"]; msg['To']=to_email; msg['Subject']=subject; msg.set_content(body)
@@ -2122,7 +2218,12 @@ def handle_google_callback() -> Optional[dict]:
 
 
 def require_login():
-    ensure_default_admin_and_facility(); st.session_state.setdefault('auth_user', None)
+    try:
+        ensure_default_admin_and_facility()
+    except RuntimeError as exc:
+        st.error(str(exc))
+        st.stop()
+    st.session_state.setdefault('auth_user', None)
     if st.session_state.get('auth_user'):
         cached_user = st.session_state['auth_user']
         refreshed_user = get_user(cached_user.get('id')) if cached_user.get('id') else get_user_by_email(cached_user.get('email', ''))
@@ -2700,8 +2801,9 @@ def render_admin_page(user:dict):
                         st.error(f'No se pudo actualizar el centro: {e}')
     with tab3:
         cfg = get_smtp_config()
-        auto_email = get_bool_setting("AUTO_EMAIL_ON_NOTE", True)
+        auto_email = get_bool_setting("AUTO_EMAIL_ON_NOTE", False)
         st.code(
+            f"SMTP_ENABLED={str(cfg['enabled']).lower()}\n"
             f"SMTP_HOST={cfg['host']}\n"
             f"SMTP_PORT={cfg['port']}\n"
             f"SMTP_USER={cfg['user']}\n"
@@ -2715,9 +2817,14 @@ def render_admin_page(user:dict):
 # =========================================================
 # Inicialización
 # =========================================================
+validate_startup_security()
 init_db()
 seed_cie10_if_empty()
-ensure_default_admin_and_facility()
+try:
+    ensure_default_admin_and_facility()
+except RuntimeError as exc:
+    st.error(str(exc))
+    st.stop()
 
 def clear_patient_form_state():
     st.session_state['patient_id'] = None
@@ -2758,32 +2865,44 @@ page = st.session_state.get('active_page', 'Agenda')
 
 with st.sidebar:
     render_app_brand(compact=True)
-    render_info_card('Usuario', f"{auth_user.get('full_name') or auth_user.get('email')} · Perfil: {auth_user.get('role')}", '#0F4C81')
+    render_info_card('Usuario', f"{auth_user.get('full_name') or auth_user.get('email')} | Perfil: {auth_user.get('role')}", '#0F4C81')
 
     st.markdown('---')
-    st.subheader('Navegación rápida')
-    st.write('Usa los botones para cambiar de módulo:')
+    st.subheader('Navegacion')
     render_sidebar_nav_button('Menú principal', None, 'nav_menu_principal')
     render_sidebar_nav_button('Agenda', 'Agenda', 'nav_agenda')
     render_sidebar_nav_button('Atención clínica', 'Atención clínica', 'nav_atencion_clinica')
-    render_sidebar_nav_button('Historial atenciones de pacientes', 'Pacientes', 'nav_pacientes')
+    render_sidebar_nav_button('Pacientes e historial', 'Pacientes', 'nav_pacientes')
     if is_admin_user(auth_user):
         render_sidebar_nav_button('Administrador', 'Administrador', 'nav_administrador')
     current_active = get_active_page_label()
     st.markdown(
-        f'<span class="as-current-page-pill">Pagina actual: {html.escape(str(current_active))}</span>',
+        f'<span class="as-current-page-pill">Actual: {html.escape(str(current_active))}</span>',
         unsafe_allow_html=True,
     )
-    render_info_card('Página activa', current_active, '#1B998B')
 
     st.markdown('---')
-    st.subheader('Google OAuth')
-    if not google_login_enabled():
-        st.info('Google login deshabilitado.')
-    elif google_oauth_configured():
-        st.success('Google login habilitado')
+    st.subheader("Contexto")
+    active_patient = get_patient(st.session_state.get("patient_id")) if st.session_state.get("patient_id") else None
+    active_encounter = get_encounter(st.session_state.get("encounter_id")) if st.session_state.get("encounter_id") else None
+    if active_patient:
+        st.write(f"Paciente: {active_patient.get('mrn') or active_patient.get('id')} - {active_patient.get('first_name','')} {active_patient.get('last_name','')}")
     else:
-        st.info('Para habilitar Google login, agrega GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET y GOOGLE_REDIRECT_URI como variables de entorno o en st.secrets')
+        st.caption("Sin paciente activo.")
+    if active_encounter:
+        status_label = "Revisado" if is_physician_reviewed(active_encounter) else "Borrador IA"
+        st.write(f"Consulta: #{active_encounter.get('id')} | {status_label}")
+    else:
+        st.caption("Sin consulta activa.")
+
+    st.markdown('---')
+    st.subheader("Integraciones")
+    hl7_sidebar_settings = HL7Settings.from_env()
+    fhir_sidebar_enabled = get_bool_setting("FHIR_ENABLED", False)
+    st.caption(f"HL7: {hl7_sidebar_settings.transport_label}")
+    st.caption(f"FHIR: {'activado' if fhir_sidebar_enabled else 'solo export local'}")
+    if google_login_enabled():
+        st.caption(f"Google OAuth: {'configurado' if google_oauth_configured() else 'pendiente'}")
 
     st.markdown('---')
     if st.button('Cerrar sesión', key='logout'):
@@ -2800,28 +2919,6 @@ if page == 'Administrador':
     render_admin_page(auth_user); st.stop()
 
 render_page_header('Atención clínica ambulatoria', 'Ficha clínica local: pacientes, CIE-10, nota IA, exportación clínica, correo automático y HL7 v2 preparado para integración HIS.')
-
-with st.sidebar:
-    st.subheader("Estado")
-    st.write("Base de datos:", DB_PATH)
-    st.write("Audios:", SESSIONS_DIR)
-    st.write("Exportaciones:", EXPORTS_DIR)
-    st.write("Modelo nota:", LLM_MODEL)
-    st.write("Audio Windows:", DEFAULT_AUDIO_DEVICE or "Automático")
-
-    st.divider()
-    st.subheader("Paciente activo")
-    active_patient = get_patient(st.session_state.get("patient_id")) if st.session_state.get("patient_id") else None
-    if active_patient:
-        st.write(f"MRN: {active_patient.get('mrn')}")
-        st.write(f"Nombre: {active_patient.get('first_name','')} {active_patient.get('last_name','')}")
-        st.write(f"Centro: {active_patient.get('facility_name') or 'Sin centro'}")
-        st.write(f"RUN: {active_patient.get('national_id','')}")
-        st.write(f"Teléfono: {active_patient.get('phone','')}")
-        if active_patient.get('address'):
-            st.write(f"Dirección: {active_patient.get('address')}")
-    else:
-        st.caption("Aún no hay paciente activo. Busca o crea un paciente en la sección principal.")
 
 # -------------------------
 # 1. Pacientes
@@ -3395,9 +3492,26 @@ with st.expander("5) Nota clínica", expanded=True):
             st.session_state["reviewed_note_encounter_id"] = st.session_state["encounter_id"]
             st.session_state["reviewed_note_text"] = current_note
         edited_note = st.text_area("Nota clínica editable", height=360, key="reviewed_note_text")
+        if is_physician_reviewed(encounter):
+            st.success("Estado clinico: Revisado por profesional")
+        else:
+            st.warning("Estado clinico: Borrador IA pendiente de revision profesional")
         st.caption(f"Al guardar la revisión se pedirá confirmación antes de enviar a: {(auth_user.get('email') or 'sin correo configurado').strip()}")
         if st.button("Guardar revisión y preparar envío"):
             st.session_state["note_txt"] = edited_note
+            update_encounter_content(st.session_state["encounter_id"], note_text=edited_note, status="reviewed")
+            with db() as conn:
+                audit_event(
+                    conn,
+                    "note_physician_reviewed",
+                    "encounter",
+                    str(st.session_state["encounter_id"]),
+                    user_id=auth_user.get("id"),
+                    patient_id=st.session_state.get("patient_id"),
+                    encounter_id=st.session_state.get("encounter_id"),
+                    metadata={"source": "streamlit_note_review"},
+                )
+                conn.commit()
             st.session_state["pending_note_send"] = {
                 "encounter_id": st.session_state["encounter_id"],
                 "note_text": edited_note,
@@ -3420,16 +3534,25 @@ with st.expander("5) Nota clínica", expanded=True):
         with e1:
             if st.button("Exportar nota .txt"):
                 out = export_txt(edited_note, f"nota_encuentro_{st.session_state['encounter_id']}_{int(time.time())}.txt")
+                with db() as conn:
+                    audit_event(conn, "txt_exported", "encounter", str(st.session_state["encounter_id"]), user_id=auth_user.get("id"), patient_id=st.session_state.get("patient_id"), encounter_id=st.session_state.get("encounter_id"), metadata={"path": out})
+                    conn.commit()
                 st.success(f"Guardado: {out}")
         with e2:
             if st.button("Exportar nota .docx"):
                 out = export_docx("Ficha clínica ambulatoria", edited_note, f"nota_encuentro_{st.session_state['encounter_id']}_{int(time.time())}.docx")
+                with db() as conn:
+                    audit_event(conn, "docx_exported", "encounter", str(st.session_state["encounter_id"]), user_id=auth_user.get("id"), patient_id=st.session_state.get("patient_id"), encounter_id=st.session_state.get("encounter_id"), metadata={"path": out})
+                    conn.commit()
                 st.success(f"Guardado: {out}")
         with e3:
             if st.button("Exportar FHIR JSON"):
                 patient = get_patient(st.session_state["patient_id"])
                 diag_df = get_diagnoses_df(st.session_state["encounter_id"])
                 out = export_fhir_bundle_json(patient, encounter, diag_df, edited_note, note_json, auth_user)
+                with db() as conn:
+                    audit_event(conn, "fhir_exported", "encounter", str(st.session_state["encounter_id"]), user_id=auth_user.get("id"), patient_id=st.session_state.get("patient_id"), encounter_id=st.session_state.get("encounter_id"), metadata={"path": out})
+                    conn.commit()
                 st.success(f"FHIR Bundle guardado: {out}")
                 st.caption("Exportacion local solamente. El envio a HIS/RCE requiere FHIR_ENABLED=true, validacion medica y API formal.")
     else:
@@ -3439,28 +3562,53 @@ with st.expander("5) Nota clínica", expanded=True):
 # 6. HL7
 # -------------------------
 with st.expander("6) Integración HIS mediante mensajería HL7 v2", expanded=True):
-    st.caption("Esta versión genera archivos HL7 v2.5 listos para prueba de interfaz. El envío TCP/MLLP real debe activarse cuando el HIS entregue host, puerto, versión, mapping y reglas de ACK.")
+    hl7_settings = HL7Settings.from_env()
+    st.caption("Arquitectura HL7 v2.5 lista para motor externo. Por defecto no envia a HIS/RCE; genera cola y archivos locales.")
+    st.info(f"Estado integracion: {hl7_settings.transport_label} | Version: {hl7_settings.version} | Requiere revision medica: {hl7_settings.require_review}")
     if not st.session_state.get("patient_id") or not st.session_state.get("encounter_id"):
         st.warning("Selecciona paciente y consulta.")
     else:
         patient = get_patient(st.session_state["patient_id"])
         encounter = get_encounter(st.session_state["encounter_id"])
         diag_df = get_diagnoses_df(st.session_state["encounter_id"])
-        h1, h2 = st.columns(2)
-        with h1:
-            if st.button("Generar ADT^A04 registro ambulatorio"):
-                msg = build_adt_a04(patient, encounter)
-                path = save_hl7_message(st.session_state["encounter_id"], "ADT_A04", msg)
-                st.session_state["last_hl7"] = msg
-                st.success(f"HL7 ADT^A04 generado: {path}")
-        with h2:
-            if st.button("Generar MDM^T02 nota clínica"):
-                msg = build_mdm_t02(patient, encounter, diag_df)
-                path = save_hl7_message(st.session_state["encounter_id"], "MDM_T02", msg)
-                st.session_state["last_hl7"] = msg
-                st.success(f"HL7 MDM^T02 generado: {path}")
-        if st.session_state.get("last_hl7"):
-            st.text_area("Último mensaje HL7 generado", st.session_state["last_hl7"].replace("\r", "\n"), height=320)
+        reviewed = is_physician_reviewed(encounter)
+        st.write(f"Estado nota: {'Revisado por profesional' if reviewed else 'Borrador IA'}")
+        latest_message = latest_hl7_queue_message(st.session_state["encounter_id"])
+        if latest_message:
+            st.write(f"Último control_id: `{latest_message.get('control_id')}`")
+            st.write(f"Estado cola: `{latest_message.get('status')}` | Tipo: `{latest_message.get('message_type')}`")
+        else:
+            st.caption("Aún no hay mensajes HL7 en cola para esta consulta.")
+
+        selected_hl7_type = st.selectbox("Tipo mensaje", ["MDM_T02", "ADT_A04"], format_func=lambda x: "MDM^T02 nota clinica" if x == "MDM_T02" else "ADT^A04 registro ambulatorio")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            if st.button("Generar HL7 borrador"):
+                message_id = create_hl7_draft(patient, encounter, diag_df, selected_hl7_type, auth_user.get("id"))
+                st.session_state["selected_hl7_message_id"] = message_id
+                st.success(f"Borrador HL7 en cola: #{message_id}")
+                st.rerun()
+        selected_message_id = st.session_state.get("selected_hl7_message_id") or (latest_message or {}).get("id")
+        with c2:
+            if st.button("Validar para envío", disabled=not selected_message_id):
+                ok, msg = validate_hl7_queue_message(int(selected_message_id), get_encounter(st.session_state["encounter_id"]))
+                st.success(msg) if ok else st.error(msg)
+                st.rerun()
+        with c3:
+            if st.button("Exportar archivo HL7", disabled=not selected_message_id):
+                ok, msg = export_hl7_queue_message(int(selected_message_id), auth_user.get("id"))
+                st.success(f"Archivo HL7 guardado: {msg}") if ok else st.error(msg)
+        with c4:
+            send_enabled = hl7_settings.enabled and selected_message_id
+            if st.button("Enviar HL7", disabled=not send_enabled):
+                ok, msg = send_hl7_queue_message(int(selected_message_id), auth_user.get("id"))
+                st.success(f"Transporte HL7 completado: {prevent_phi_in_logs(msg)}") if ok else st.error(msg)
+
+        refreshed_message = latest_hl7_queue_message(st.session_state["encounter_id"])
+        if refreshed_message:
+            with st.expander("Ver payload HL7 completo (contiene datos clinicos)", expanded=False):
+                st.warning("El payload puede contener datos sensibles. Usar solo para pruebas autorizadas.")
+                st.text_area("Payload HL7", refreshed_message["payload"].replace("\r", "\n"), height=320)
 
 # -------------------------
 # 7. Transcripción, imágenes, chat
