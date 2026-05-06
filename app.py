@@ -456,6 +456,29 @@ def inject_custom_css():
             font-size: 0.9rem;
         }
 
+        section[data-testid="stSidebar"] .as-brand-card h3,
+        section[data-testid="stSidebar"] .as-brand-card p {
+            color: #FFFFFF;
+        }
+
+        .as-sidebar-brand {
+            padding: 0.25rem 0 0.75rem 0;
+        }
+
+        .as-sidebar-brand-title {
+            color: var(--as-blue);
+            font-weight: 850;
+            line-height: 1.1;
+            font-size: 1.05rem;
+        }
+
+        .as-sidebar-brand-subtitle {
+            color: var(--as-muted);
+            line-height: 1.2;
+            font-size: 0.82rem;
+            margin-top: 0.15rem;
+        }
+
         .as-current-page-pill {
             display: inline-block;
             background: var(--as-soft-blue);
@@ -503,8 +526,13 @@ def render_page_header(title, subtitle=None):
 
 def render_app_brand(compact=False):
     if os.path.exists(APP_ICON_PATH):
-        st.image(APP_ICON_PATH, width=72 if compact else 96)
+        st.image(APP_ICON_PATH, width=56 if compact else 96)
     if compact:
+        st.markdown(
+            f'<div class="as-sidebar-brand"><div class="as-sidebar-brand-title">{html.escape(APP_NAME)}</div><div class="as-sidebar-brand-subtitle">Asistente clinico con IA</div></div>',
+            unsafe_allow_html=True,
+        )
+    else:
         st.markdown(
             f'<div class="as-brand-card"><h3>{html.escape(APP_NAME)}</h3><p>Asistente clinico con IA</p></div>',
             unsafe_allow_html=True,
